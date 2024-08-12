@@ -4,27 +4,25 @@ use std::{
     time::{Duration, Instant},
 };
 
-use async_compat::CompatExt;
 use async_socks5::AddrKind;
 use async_trait::async_trait;
 use bytes::Bytes;
-use concurrent_queue::ConcurrentQueue;
 use http_body_util::{BodyExt, Full};
 use hyper::{client::conn::http1::SendRequest, Request};
+use hyper_util::rt::TokioIo;
 use nanorpc::{JrpcRequest, JrpcResponse, RpcTransport};
-use smol::{future::FutureExt, net::TcpStream};
 use std::io::Result as IoResult;
+use tokio::sync::Mutex;
+use tokio::{net::TcpStream, time::timeout};
 
 type Conn = SendRequest<Full<Bytes>>;
 
 /// An HTTP-based [RpcTransport] for nanorpc.
 pub struct HttpRpcTransport {
-    exec: smol::Executor<'static>,
     remote: String,
     proxy: Proxy,
-    pool: ConcurrentQueue<(Conn, Instant)>,
+    pool: Mutex<Vec<(Conn, Instant)>>,
     idle_timeout: Duration,
-
     req_timeout: RwLock<Duration>,
 }
 
@@ -40,10 +38,9 @@ impl HttpRpcTransport {
     /// Currently, custom paths, HTTPS, etc are not supported.
     pub fn new(remote: String, proxy: Proxy) -> Self {
         Self {
-            exec: smol::Executor::new(),
             remote,
             proxy,
-            pool: ConcurrentQueue::bounded(64),
+            pool: Mutex::new(Vec::with_capacity(64)),
             idle_timeout: Duration::from_secs(60),
             req_timeout: Duration::from_secs(30).into(),
         }
@@ -66,17 +63,17 @@ impl HttpRpcTransport {
 
     /// Opens a new connection to the remote.
     async fn open_conn(&self) -> IoResult<Conn> {
-        while let Ok((conn, expiry)) = self.pool.pop() {
+        let mut pool = self.pool.lock().await;
+        while let Some((conn, expiry)) = pool.pop() {
             if expiry.elapsed() < self.idle_timeout {
                 return Ok(conn);
             }
         }
 
-        let conn = match &self.proxy {
+        let stream = match &self.proxy {
             Proxy::Direct => TcpStream::connect(self.remote.clone()).await?,
             Proxy::Socks5(proxy_addr) => {
-                let tcp_stream = TcpStream::connect(proxy_addr).await?;
-                let mut compat_stream = tcp_stream.compat();
+                let mut tcp_stream = TcpStream::connect(proxy_addr).await?;
 
                 // TODO: this doesn't handle normal domains with .haven, find a smarter way.
                 let processed_remote: AddrKind = if self.remote.contains(".haven") {
@@ -89,23 +86,23 @@ impl HttpRpcTransport {
                             .expect("invalid socket address"),
                     )
                 };
-                async_socks5::connect(&mut compat_stream, processed_remote, None)
+                async_socks5::connect(&mut tcp_stream, processed_remote, None)
                     .await
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
-                compat_stream.into_inner()
+                tcp_stream
             }
         };
 
-        let (conn, handle) = hyper::client::conn::http1::handshake(conn.compat())
+        let io = TokioIo::new(stream);
+
+        let (conn, handle) = hyper::client::conn::http1::handshake(io)
             .await
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::BrokenPipe, e))?;
 
-        self.exec
-            .spawn(async move {
-                let _ = handle.await;
-            })
-            .detach();
+        tokio::spawn(async move {
+            let _ = handle.await;
+        });
 
         Ok(conn)
     }
@@ -139,8 +136,8 @@ impl RpcTransport for HttpRpcTransport {
     type Error = std::io::Error;
 
     async fn call_raw(&self, req: JrpcRequest) -> Result<JrpcResponse, Self::Error> {
-        let timeout = *self.req_timeout.read().unwrap();
-        async {
+        let timeout_duration = *self.req_timeout.read().unwrap();
+        let result = timeout(timeout_duration, async {
             let mut conn = self.open_conn().await?;
             let response = conn
                 .send_request(
@@ -159,17 +156,18 @@ impl RpcTransport for HttpRpcTransport {
                 .to_bytes();
             let resp = serde_json::from_slice(&response)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-            let _ = self.pool.push((conn, Instant::now()));
+            let mut pool = self.pool.lock().await;
+            pool.push((conn, Instant::now()));
             Ok(resp)
-        }
-        .or(async {
-            smol::Timer::after(timeout).await;
-            Err(std::io::Error::new(
+        })
+        .await;
+
+        match result {
+            Ok(result) => result,
+            Err(_) => Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
                 "nanorpc-http request timed out",
-            ))
-        })
-        .or(self.exec.run(smol::future::pending()))
-        .await
+            )),
+        }
     }
 }
